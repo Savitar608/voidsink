@@ -23,9 +23,11 @@ scrape_configs:
         protocol: protocol
         source_ip: source_ip
         target_port: target_port
+        country: country
   - labels:
       protocol:
       source_ip:
+      country:
   - timestamp:
       source: timestamp
       format: RFC3339

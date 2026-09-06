@@ -163,6 +163,7 @@ func startTCPListener(port int, handler func(net.Conn)) {
 
 func main() {
 	var err error
+	log.Println("[+] Starting voidsink...")
 	logFile, err = os.OpenFile("/logs/voidsink.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		log.Fatalf("Failed to open log file: %v", err)

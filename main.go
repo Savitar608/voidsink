@@ -10,28 +10,84 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 )
 
-// TelemetryEvent represents a standardized security event
+type GeoInfo struct {
+	Country string `json:"country"`
+	City    string `json:"city"`
+	ISP     string `json:"isp"`
+}
+
 type TelemetryEvent struct {
 	Timestamp string `json:"timestamp"`
 	Protocol  string `json:"protocol"`
 	SourceIP  string `json:"source_ip"`
 	Port      int    `json:"target_port"`
 	Payload   string `json:"payload"`
+	Country   string `json:"country"`
+	City      string `json:"city"`
+	ISP       string `json:"isp"`
 }
 
-var logFile *os.File
+var (
+	logFile  *os.File
+	geoCache = make(map[string]GeoInfo)
+	cacheMu  sync.Mutex
+)
+
+func getGeo(ip string) GeoInfo {
+	// Check cache first to prevent API rate-limiting
+	cacheMu.Lock()
+	if info, exists := geoCache[ip]; exists {
+		cacheMu.Unlock()
+		return info
+	}
+	cacheMu.Unlock()
+
+	// Fetch from free IP API
+	url := fmt.Sprintf("http://ip-api.com/json/%s?fields=status,country,city,isp", ip)
+	resp, err := http.Get(url)
+	if err == nil {
+		defer resp.Body.Close()
+		var result struct {
+			Status  string `json:"status"`
+			Country string `json:"country"`
+			City    string `json:"city"`
+			ISP     string `json:"isp"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&result); err == nil && result.Status == "success" {
+			info := GeoInfo{Country: result.Country, City: result.City, ISP: result.ISP}
+			// Save to cache
+			cacheMu.Lock()
+			geoCache[ip] = info
+			cacheMu.Unlock()
+			return info
+		}
+	}
+	return GeoInfo{Country: "Unknown", City: "Unknown", ISP: "Unknown"}
+}
 
 func logEvent(protocol string, remoteAddr string, port int, payload string) {
 	ip := strings.Split(remoteAddr, ":")[0]
+	
+	// Ignore local Docker network tests
+	if ip == "127.0.0.1" || strings.HasPrefix(ip, "172.") {
+		return
+	}
+
+	geo := getGeo(ip)
+
 	event := TelemetryEvent{
 		Timestamp: time.Now().UTC().Format(time.RFC3339),
 		Protocol:  protocol,
 		SourceIP:  ip,
 		Port:      port,
 		Payload:   strings.TrimSpace(payload),
+		Country:   geo.Country,
+		City:      geo.City,
+		ISP:       geo.ISP,
 	}
 
 	data, err := json.Marshal(event)
@@ -39,46 +95,36 @@ func logEvent(protocol string, remoteAddr string, port int, payload string) {
 		return
 	}
 
-	// Write to both stdout and telemetry file
 	fmt.Println(string(data))
 	if logFile != nil {
 		logFile.Write(append(data, '\n'))
 	}
 }
 
-// 1. Fake Telnet (Port 23) - Catches IoT/Mirai brute-force credential sprays
+// 1. Fake Telnet
 func handleTelnet(conn net.Conn) {
 	defer conn.Close()
 	conn.SetDeadline(time.Now().Add(15 * time.Second))
-
-	// Send generic Linux login prompt
 	conn.Write([]byte("Ubuntu 24.04 LTS\r\nlogin: "))
-
 	reader := bufio.NewReader(io.LimitReader(conn, 1024))
 	username, _ := reader.ReadString('\n')
-
 	conn.Write([]byte("Password: "))
 	password, _ := reader.ReadString('\n')
-
-	logEvent("telnet", conn.RemoteAddr().String(), 23, fmt.Sprintf("user: %s | pass: %s", username, password))
+	go logEvent("telnet", conn.RemoteAddr().String(), 23, fmt.Sprintf("user: %s | pass: %s", username, password))
 	conn.Write([]byte("\r\nLogin incorrect\r\n"))
 }
 
-// 2. Fake Redis (Port 6379) - Catches crypto-miner droppers and INFO sweeps
+// 2. Fake Redis
 func handleRedis(conn net.Conn) {
 	defer conn.Close()
 	conn.SetDeadline(time.Now().Add(10 * time.Second))
-
 	buf := make([]byte, 2048)
 	n, err := conn.Read(buf)
 	if err != nil {
 		return
 	}
-
 	rawCmd := string(buf[:n])
-	logEvent("redis", conn.RemoteAddr().String(), 6379, rawCmd)
-
-	// Respond with realistic Redis errors or version info
+	go logEvent("redis", conn.RemoteAddr().String(), 6379, rawCmd)
 	if strings.Contains(strings.ToUpper(rawCmd), "PING") {
 		conn.Write([]byte("+PONG\r\n"))
 	} else if strings.Contains(strings.ToUpper(rawCmd), "INFO") {
@@ -88,24 +134,16 @@ func handleRedis(conn net.Conn) {
 	}
 }
 
-// 3. Fake Web/Admin Server (Port 8080) - Catches vulnerability scans (.env, path traversal, exploit payloads)
+// 3. Fake Web Server
 func startHTTPServer() {
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		payload := fmt.Sprintf("%s %s (User-Agent: %s)", r.Method, r.URL.RequestURI(), r.UserAgent())
-		logEvent("http", r.RemoteAddr, 8080, payload)
-
-		// Deceptive 404/mock header
+		go logEvent("http", r.RemoteAddr, 8080, payload)
 		w.Header().Set("Server", "Apache/2.4.52 (Ubuntu)")
 		w.WriteHeader(http.StatusNotFound)
 		w.Write([]byte("<!DOCTYPE HTML PUBLIC \"-//IETF//DTD HTML 2.0//EN\">\n<html><head>\n<title>404 Not Found</title>\n</head><body>\n<h1>Not Found</h1>\n<p>The requested URL was not found on this server.</p>\n</body></html>"))
 	})
-
-	srv := &http.Server{
-		Addr:         ":8080",
-		Handler:      handler,
-		ReadTimeout:  5 * time.Second,
-		WriteTimeout: 5 * time.Second,
-	}
+	srv := &http.Server{Addr: ":8080", Handler: handler, ReadTimeout: 5 * time.Second, WriteTimeout: 5 * time.Second}
 	log.Fatal(srv.ListenAndServe())
 }
 
@@ -115,13 +153,11 @@ func startTCPListener(port int, handler func(net.Conn)) {
 		log.Fatalf("Failed to bind port %d: %v", port, err)
 	}
 	defer listener.Close()
-
 	for {
 		conn, err := listener.Accept()
-		if err != nil {
-			continue
+		if err == nil {
+			go handler(conn)
 		}
-		go handler(conn)
 	}
 }
 
@@ -133,8 +169,7 @@ func main() {
 	}
 	defer logFile.Close()
 
-	log.Println("[+] Honeypot active. Listening on ports 23 (Telnet), 6379 (Redis), 8080 (HTTP)...")
-
+	log.Println("[+] voidsink active. Listening on ports 23, 6379, 8080...")
 	go startTCPListener(23, handleTelnet)
 	go startTCPListener(6379, handleRedis)
 	startHTTPServer()
